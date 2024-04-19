@@ -1,11 +1,17 @@
 import * as WebSocket from 'ws';
 import { MessageServer } from './message-server';
-import { Message, MessageTypes, UUID } from '../../shared/messages';
+import { Message, MessageTypes, UUID } from './shared/messages';
 
 type Replies = Map<WebSocket, Message>;
+
 export class BlockchainServer extends MessageServer<Message> {
-  private readonly receivedMessageAwaitingResponse = new Map<UUID, WebSocket>();
-  private readonly sendMessagesAwaitingReply = new Map<UUID, Replies>();
+  private readonly receivedMessagesAwaitingResponse = new Map<
+    UUID,
+    WebSocket
+  >();
+
+  private readonly sentMessagesAwaitingReply = new Map<UUID, Replies>(); // Used as accumulator for replies from clients.
+
   protected handleMessage(sender: WebSocket, message: Message): void {
     switch (message.type) {
       case MessageTypes.GetLongestChainRequest:
@@ -17,24 +23,27 @@ export class BlockchainServer extends MessageServer<Message> {
       case MessageTypes.NewBlockAnnouncement:
         return this.handleNewBlockAnnouncement(sender, message);
       default: {
-        console.log(`Received message of unknown type: ${message.type}`);
+        console.log(`Received message of unknown type: "${message.type}"`);
       }
     }
   }
 
   private handleGetLongestChainRequest(
-    requester: WebSocket,
+    requestor: WebSocket,
     message: Message,
   ): void {
+    // If there are other nodes in the network ask them about their chains.
+    // Otherwise immediately reply to the requestor with an empty array.
+
     if (this.clientIsNotAlone) {
-      this.receivedMessageAwaitingResponse.set(
+      this.receivedMessagesAwaitingResponse.set(
         message.correlationId,
-        requester,
+        requestor,
       );
-      this.sendMessagesAwaitingReply.set(message.correlationId, new Map());
-      this.broadcastExcept(requester, message);
+      this.sentMessagesAwaitingReply.set(message.correlationId, new Map()); // Map accumulates replies from clients
+      this.broadcastExcept(requestor, message);
     } else {
-      this.replyTo(requester, {
+      this.replyTo(requestor, {
         type: MessageTypes.GetLongestChainResponse,
         correlationId: message.correlationId,
         payload: [],
@@ -46,44 +55,49 @@ export class BlockchainServer extends MessageServer<Message> {
     sender: WebSocket,
     message: Message,
   ): void {
-    if (this.receivedMessageAwaitingResponse.has(message.correlationId)) {
-      const requester = this.receivedMessageAwaitingResponse.get(
+    if (this.receivedMessagesAwaitingResponse.has(message.correlationId)) {
+      const requestor = this.receivedMessagesAwaitingResponse.get(
         message.correlationId,
       );
+
       if (this.everyoneReplied(sender, message)) {
-        const allReplies = this.sendMessagesAwaitingReply
+        const allReplies = this.sentMessagesAwaitingReply
           .get(message.correlationId)
           .values();
         const longestChain = Array.from(allReplies).reduce(
           this.selectTheLongestChain,
         );
-        this.replyTo(requester, longestChain);
+        this.replyTo(requestor, longestChain);
       }
     }
   }
 
   private handleAddTransactionsRequest(
-    requester: WebSocket,
+    requestor: WebSocket,
     message: Message,
   ): void {
-    this.broadcastExcept(requester, message);
+    this.broadcastExcept(requestor, message);
   }
 
   private handleNewBlockAnnouncement(
-    requester: WebSocket,
+    requestor: WebSocket,
     message: Message,
   ): void {
-    this.broadcastExcept(requester, message);
+    this.broadcastExcept(requestor, message);
   }
 
+  // NOTE: naive implementation that assumes no clients added or removed after the server requested the longest chain.
+  // Otherwise the server may await a reply from a client that has never received the request.
   private everyoneReplied(sender: WebSocket, message: Message): boolean {
-    const repliedClients = this.sendMessagesAwaitingReply
+    const repliedClients = this.sentMessagesAwaitingReply
       .get(message.correlationId)
       .set(sender, message);
+
     const awaitingForClients = Array.from(this.clients).filter(
-      (client) => !repliedClients.has(client),
+      (c) => !repliedClients.has(c),
     );
-    return awaitingForClients.length === 1;
+
+    return awaitingForClients.length === 1; // 1 - the one who requested.
   }
 
   private selectTheLongestChain(
